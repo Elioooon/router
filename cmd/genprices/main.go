@@ -87,6 +87,16 @@ func buildBlock(table map[string]otel.Pricing) string {
 		}
 		fmt.Fprintf(&b, "    %-*s %s%s\n", pad, entry, fmtPrice(table[m].OutputUSDPer1M/1000), comma)
 	}
+	b.WriteString("  },\n")
+	b.WriteString("  \"cache_read\": {\n")
+	for i, m := range models {
+		entry := fmt.Sprintf("%q:", m)
+		comma := ","
+		if i == len(models)-1 {
+			comma = ""
+		}
+		fmt.Fprintf(&b, "    %-*s %s%s\n", pad, entry, fmtCatalogPrice(table[m].EffectiveCacheReadMultiplier()), comma)
+	}
 	b.WriteString("  }\n")
 	b.WriteString("}'")
 	return b.String()
