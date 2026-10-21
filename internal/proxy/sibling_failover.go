@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"weave-os/router/internal/observability"
+	"weave-os/router/internal/providers"
 	"weave-os/router/internal/router"
 	"weave-os/router/internal/router/catalog"
 )
@@ -328,6 +329,42 @@ func (s *Service) gatewayRescueDecisions(ctx context.Context, failed router.Deci
 		return gatewayProviderFor(id, custom, gw)
 	}
 	return s.rescueWalkOrReadmitCooling(ctx, failed, candidates, reason, excludedModels, automaticExcluded, est, sigSavings, outputReserve, providerFor)
+}
+
+// subscriptionSiblingAllowed reports whether sibling rescue is permitted
+// despite a subscription OAuth credential disabling generic failover. A
+// customer's own API key binds the turn to one vendor, but a Codex or Claude
+// plan is a funding source, not the only credential: every rescue candidate
+// re-resolves its own credential, so an overloaded plan-served model can still
+// hand the turn to the next scored candidate. BYOK keys keep the generic rule.
+func (s *Service) subscriptionSiblingAllowed(ctx context.Context) bool {
+	if s.byokOnly || len(externalKeysFromContext(ctx)) > 0 {
+		return false
+	}
+	creds := CredentialsFromContext(ctx)
+	return creds != nil && creds.OAuth
+}
+
+// rescueCredentialContext drops a subscription OAuth bearer before a rescue
+// candidate on another provider resolves its own credential: a ChatGPT or
+// Claude token authenticates only against its own vendor. Keyed on the
+// credential's provider, not the failed decision's, because the sibling walk
+// rebinds the decision after every failed candidate.
+func rescueCredentialContext(ctx context.Context, rescueProvider string) context.Context {
+	creds := CredentialsFromContext(ctx)
+	if creds == nil || !creds.OAuth || oauthCredentialProvider(creds) == rescueProvider {
+		return ctx
+	}
+	return clearCredentials(ctx)
+}
+
+// Codex subscription tokens are OpenAI-only; any other subscription OAuth
+// bearer is a Claude token and authenticates only against Anthropic.
+func oauthCredentialProvider(creds *Credentials) string {
+	if creds.Source == credSourceCodexSubscription {
+		return providers.ProviderOpenAI
+	}
+	return providers.ProviderAnthropic
 }
 
 // gatewaySiblingAllowed reports whether sibling rescue is permitted despite

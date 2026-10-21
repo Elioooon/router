@@ -2,8 +2,11 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"weave-os/router/internal/auth"
@@ -107,6 +110,9 @@ func (s *Service) authorizeSubscriptionAPI(ctx context.Context, pool subscriptio
 		return fmt.Errorf("%w: subscription enrollment could not be verified", ErrSubscriptionPoolUnavailable)
 	}
 	now := s.clockNow()
+	if subscriptionProviderUnavailable(ctx, pool, now) {
+		return nil
+	}
 	candidates, snapshotPresent := ctx.Value(managedSubscriptionCandidatesKey{}).([]managedSubscriptionCandidate)
 	for _, candidate := range candidates {
 		// A seat that can never be leased can never prove exhaustion either.
@@ -143,6 +149,78 @@ func (s *Service) authorizeSubscriptionAPI(ctx context.Context, pool subscriptio
 		return fmt.Errorf("%w: caller subscription quota is available or unknown", ErrSubscriptionPoolUnavailable)
 	}
 	return nil
+}
+
+// subscriptionUnavailableCooldown bounds how long a provider 5xx seen on a
+// subscription attempt keeps authorizing paid rescue for the same turn.
+const subscriptionUnavailableCooldown = time.Minute
+
+// recordSubscriptionUnavailable notes that a subscription-funded attempt for
+// provider/model failed on provider capacity (a 5xx, never a 429, which the
+// quota path owns). The mark is request-scoped and expires with the cooldown,
+// so it lets this turn be rescued on paid capacity without claiming the plan's
+// included quota is spent.
+func (s *Service) recordSubscriptionUnavailable(ctx context.Context, provider, model string, attemptErr error) {
+	pool, compatible := managedSubscriptionProviderFromUpstream(provider, model)
+	if !compatible || !upstreamServerFailure(attemptErr) || callerModelPassthroughActive(ctx) {
+		return
+	}
+	state, _ := ctx.Value(ManagedSubscriptionUsageContextKey{}).(*ManagedSubscriptionUsage)
+	if state == nil {
+		return
+	}
+	if state.UnavailableProviders == nil {
+		state.UnavailableProviders = make(map[subscriptions.Provider]time.Time)
+	}
+	state.UnavailableProviders[pool] = s.clockNow().Add(subscriptionUnavailableCooldown)
+	observability.FromContext(ctx).Warn("Subscription attempt failed on provider capacity; paid rescue authorized for this turn",
+		"provider", provider, "model", model, "subscription_provider", pool, "upstream_status", upstreamStatus(attemptErr))
+}
+
+// upstreamServerFailure reports a buffered upstream 5xx: the provider answered
+// and could not serve. Timeouts, transport faults and 429s are excluded; they
+// say nothing about the plan's capacity to serve. So is the router's own
+// empty-completion 502: the plan did answer, with nothing usable, and buying
+// paid capacity for it would turn a client's identical retries into spend.
+func upstreamServerFailure(err error) bool {
+	var buffered *providers.UpstreamErrorResponse
+	if !errors.As(err, &buffered) || buffered.Status < http.StatusInternalServerError {
+		return false
+	}
+	if errors.Is(err, providers.ErrUpstreamEmptyCompletion) {
+		return false
+	}
+	// A failed Responses payload surfaces as a 5xx too; one that names the
+	// plan's quota or a rate limit belongs to the quota/throttle path.
+	if _, quota := codexQuotaExhaustion(err); quota {
+		return false
+	}
+	var envelope struct {
+		Error struct {
+			Type string `json:"type"`
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(buffered.Body, &envelope) == nil {
+		for _, label := range []string{envelope.Error.Type, envelope.Error.Code} {
+			if _, quota := codexQuotaErrorTypes[label]; quota || strings.Contains(label, "rate_limit") {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// subscriptionPoolUnavailable reports whether the plan pool behind
+// provider/model carries a live "cannot serve this turn" mark.
+func (s *Service) subscriptionPoolUnavailable(ctx context.Context, provider, model string) bool {
+	pool, compatible := managedSubscriptionProviderFromUpstream(provider, model)
+	return compatible && subscriptionProviderUnavailable(ctx, pool, s.clockNow())
+}
+
+func subscriptionProviderUnavailable(ctx context.Context, pool subscriptions.Provider, now time.Time) bool {
+	state, _ := ctx.Value(ManagedSubscriptionUsageContextKey{}).(*ManagedSubscriptionUsage)
+	return state != nil && state.UnavailableProviders[pool].After(now)
 }
 
 func (s *Service) managedAccountQuotaExhausted(ctx context.Context, candidate managedSubscriptionCandidate, now time.Time) bool {
