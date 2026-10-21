@@ -30,6 +30,7 @@ import (
 	"weave-os/router/internal/router"
 	"weave-os/router/internal/router/bandit"
 	"weave-os/router/internal/router/bandswap"
+	"weave-os/router/internal/router/breaker"
 	"weave-os/router/internal/router/cache"
 	"weave-os/router/internal/router/catalog"
 	"weave-os/router/internal/router/cluster"
@@ -301,6 +302,11 @@ type Service struct {
 	// ROUTER_RATE_LIMIT_COOLDOWN_SECONDS; see ResolveTransientRateLimit.
 	transientRateLimit       bool
 	rateLimitCooldownSeconds int
+	// providerOverloaded is the deployment default for
+	// ROUTER_PROVIDER_OVERLOADED; overloadBreaker is the replica's per-model
+	// 529 circuit registry. See ResolveProviderOverloaded.
+	providerOverloaded bool
+	overloadBreaker    *breaker.Registry
 	// sseKeepalive is the client-silence budget before a ping is injected
 	// (ROUTER_SSE_KEEPALIVE_INTERVAL_SECONDS; 0 disables). See sse.KeepaliveWriter.
 	sseKeepalive time.Duration
@@ -4051,6 +4057,7 @@ func (s *Service) ProxyMessages(ctx context.Context, body []byte, w http.Respons
 		return routeErr
 	}
 	ctx = requestcontext.WithCallerModelPassthrough(ctx, routeRes.CallerModelPassthrough)
+	ctx = s.withTurnOverloadProbe(ctx, routeRes)
 	if preparingHandoff(ctx) {
 		return s.finishHandoffPreparation(ctx, w, env, req, routeRes)
 	}
@@ -4847,13 +4854,11 @@ func (s *Service) ProxyMessages(ctx context.Context, body []byte, w http.Respons
 	// The plan-capacity mark set during dispatch must be readable here.
 	ctx = WithManagedSubscriptionUsage(ctx)
 	siblingDecisions := subscriptionStatePaidRescueDecisions(ctx, s.siblingFailoverDecisions(ctx, rescueBasisForTurn(decision, routeRes), overflowEstimate, env.SignatureTokenSavings(), outputReserve))
-	siblingViable := s.ResolveSiblingFailover(ctx) &&
-		len(siblingDecisions) > 0 &&
+	siblingViable := len(siblingDecisions) > 0 &&
 		!agentShadowMode &&
 		!routeRes.CallerModelPassthrough &&
 		decision.Reason != translate.ReasonUserForceModel &&
-		(s.shouldFailover(ctx) || s.subscriptionSiblingAllowed(ctx) || s.gatewaySiblingAllowed(ctx, siblingDecisions[0])) &&
-		(!paidFallbackForbidden(ctx) || subscriptionStateModelsEnabled(ctx))
+		s.siblingRescueAllowed(ctx, s.gatewaySiblingAllowed(ctx, siblingDecisions[0]))
 	// When the plan credential is the only reason the walk is open, the walk
 	// must wait for the plan's own 5xx mark: a 429 or timeout on the plan must
 	// not buy a paid sibling.
@@ -7236,6 +7241,7 @@ func (s *Service) ProxyOpenAIChatCompletion(ctx context.Context, body []byte, w 
 		return err
 	}
 	ctx = requestcontext.WithCallerModelPassthrough(ctx, routeRes.CallerModelPassthrough)
+	ctx = s.withTurnOverloadProbe(ctx, routeRes)
 	if len(routeRes.SessionDisabledProviders) > 0 {
 		ctx = context.WithValue(ctx, SessionDisabledProvidersContextKey{}, routeRes.SessionDisabledProviders)
 	}
@@ -8029,12 +8035,10 @@ func (s *Service) ProxyOpenAIChatCompletion(ctx context.Context, body []byte, w 
 
 	ctx = WithManagedSubscriptionUsage(ctx)
 	siblingDecisions := subscriptionStatePaidRescueDecisions(ctx, s.siblingFailoverDecisions(ctx, rescueBasisForTurn(decision, routeRes), overflowEstimateOAI, env.SignatureTokenSavings(), outputReserveOAI))
-	siblingViable := s.ResolveSiblingFailover(ctx) &&
-		len(siblingDecisions) > 0 &&
+	siblingViable := len(siblingDecisions) > 0 &&
 		!routeRes.CallerModelPassthrough &&
 		!strings.HasPrefix(decision.Reason, translate.ReasonUserForceModel) &&
-		(s.shouldFailover(ctx) || s.subscriptionSiblingAllowed(ctx) || s.gatewaySiblingAllowed(ctx, siblingDecisions[0])) &&
-		(!paidFallbackForbidden(ctx) || subscriptionStateModelsEnabled(ctx))
+		s.siblingRescueAllowed(ctx, s.gatewaySiblingAllowed(ctx, siblingDecisions[0]))
 	subscriptionOnlySibling := siblingViable && !s.shouldFailover(ctx) &&
 		!s.gatewaySiblingAllowed(ctx, siblingDecisions[0]) && s.subscriptionSiblingAllowed(ctx)
 
