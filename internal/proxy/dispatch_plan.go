@@ -146,6 +146,11 @@ func (s *Service) dispatchPlanned(ctx context.Context, in failoverInputs, plan i
 		decision := in.initialDecision
 		decision.Provider = attempt.Target.Provider
 		guarded := dispatch.GuardTarget(client, attempt.Target)
+		trace := attemptTraceFromContext(ctx)
+		if trace != nil {
+			trace.beginAttempt()
+			guarded = dispatch.ObservePrepared(guarded, trace.observeSent)
+		}
 		var lastSubscriptionErr error
 		if usage, _ := ctx.Value(ManagedSubscriptionUsageContextKey{}).(*ManagedSubscriptionUsage); usage != nil && usage.IntendedModel == "" {
 			usage.IntendedModel = decision.Model
@@ -263,6 +268,12 @@ func (s *Service) dispatchPlanned(ctx context.Context, in failoverInputs, plan i
 				}
 				return attemptErr
 			}
+			// Describe runs once per dispatch attempt; record the failed account
+			// call before the next account overwrites the traced body.
+			if trace != nil {
+				trace.describe(ctx, attempt, attemptErr)
+				trace.beginAttempt()
+			}
 			lastSubscriptionErr = attemptErr
 			if rotationBudget.remaining <= 0 {
 				return s.afterSubscriptionRotationBudget(ctx, decision, account+1, attemptErr)
@@ -279,6 +290,11 @@ func (s *Service) dispatchPlanned(ctx context.Context, in failoverInputs, plan i
 		}
 	}
 
+	if trace := attemptTraceFromContext(ctx); trace != nil {
+		transport.Describe = func(attempt dispatch.Attempt, err error) inference.AttemptDiagnosis {
+			return trace.describe(ctx, attempt, err)
+		}
+	}
 	req := inference.InvocationRequest{Purpose: in.purpose, RequestID: observability.RequestIDFromContext(ctx)}
 	result, runErr := executor.Run(ctx, req, plan, transport)
 	s.recordOverloadOutcome(ctx, in.initialDecision.Model, lastProvider, result.Outcome.ResponseCommitted, runErr)
@@ -300,6 +316,7 @@ func (s *Service) dispatchPlanned(ctx context.Context, in failoverInputs, plan i
 	case dispatch.FailureReasonProviderNotConfigured, dispatch.FailureReasonPrepare:
 		return lastIdx, runErr
 	}
+	runErr = attributeTerminalError(attemptTraceFromContext(ctx), runErr)
 	if in.flushErr != nil && !in.deferFlushOnExhaustion && !committed(in.buf) {
 		in.flushErr(in.w, runErr)
 	}
