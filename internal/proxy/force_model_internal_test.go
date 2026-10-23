@@ -212,6 +212,27 @@ func TestResolveForceModel(t *testing.T) {
 			wantKnown:    true,
 		},
 		{
+			name:         "kimi k3.1 version pin",
+			input:        "kimi-k3.1",
+			wantID:       "moonshotai/kimi-k3.1",
+			wantProvider: providers.ProviderOpenRouter,
+			wantKnown:    true,
+		},
+		{
+			name:         "upstream kimi k3.1 pro spelling",
+			input:        "moonshotai/kimi-k3.1-pro",
+			wantID:       "moonshotai/kimi-k3.1",
+			wantProvider: providers.ProviderOpenRouter,
+			wantKnown:    true,
+		},
+		{
+			name:         "explicit kimi k3 pin remains exact",
+			input:        "kimi-k3",
+			wantID:       "moonshotai/kimi-k3",
+			wantProvider: providers.ProviderFireworks,
+			wantKnown:    true,
+		},
+		{
 			name:         "explicit kimi 2.7 pin remains exact",
 			input:        "kimi-k2.7",
 			wantID:       "moonshotai/kimi-k2.7",
