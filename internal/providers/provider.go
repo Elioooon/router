@@ -14,6 +14,8 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/net/http2"
+
 	"weave-os/router/internal/router"
 )
 
@@ -513,6 +515,20 @@ func IsResponseHeaderTimeout(err error) bool {
 		return false
 	}
 	return strings.Contains(urlErr.Err.Error(), "timeout awaiting response headers")
+}
+
+// IsHTTP2ConnectionLoss reports whether the provider's HTTP/2 connection
+// failed under the request: a stream reset, GOAWAY or connection error, or a
+// keepalive ping it never answered. The lost-ping error is untyped in x/net
+// and arrives bare from Body.Read once headers are in, so it is matched by text.
+func IsHTTP2ConnectionLoss(err error) bool {
+	var streamErr http2.StreamError
+	var goAway http2.GoAwayError
+	var connErr http2.ConnectionError
+	if errors.As(err, &streamErr) || errors.As(err, &goAway) || errors.As(err, &connErr) {
+		return true
+	}
+	return err != nil && strings.Contains(err.Error(), "http2: client connection lost")
 }
 
 // IsUpstreamModelNotFound reports whether err is a buffered upstream 404,
