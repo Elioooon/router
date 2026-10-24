@@ -2,7 +2,8 @@
 #
 # Weave Router uninstaller for Claude Code, Codex, opencode, and pi.
 #
-# Default target is Claude Code: removes the env vars, statusLine, and local
+# Without a client flag, every client with Weave Router config is uninstalled
+# in turn. --claude removes the env vars, statusLine, and local
 # router auth that install.sh added; leaves the rest of settings.json
 # untouched. Pass --codex to strip the managed [model_providers.weave]
 # block (and the matching top-level `model_provider`) from Codex's
@@ -14,7 +15,8 @@
 # weave defaults, and remove the router key file.
 #
 # Usage:
-#   npx @workweave/router --uninstall                            # Claude Code, user scope
+#   npx @workweave/router --uninstall                            # every configured client, user scope
+#   npx @workweave/router --uninstall --claude                   # Claude Code only
 #   npx @workweave/router --uninstall --codex                    # Codex, user scope
 #   npx @workweave/router --uninstall --opencode                 # opencode, user scope
 #   npx @workweave/router --uninstall --pi                       # pi, user scope
@@ -235,6 +237,8 @@ claude_statusline_router_owned() {
     && grep -Fq "$CLAUDE_STATUSLINE_MARKER" "$ownership_marker_path"
 }
 
+uninstall_args=("$@")
+target_explicit="false"
 while [ $# -gt 0 ]; do
   case "$1" in
     --scope)
@@ -247,20 +251,20 @@ while [ $# -gt 0 ]; do
       [ -n "$install_dir" ] || { err "--dir requires a path."; exit 2; }
       ;;
     --codex)
-      target="codex"; shift
+      target="codex"; target_explicit="true"; shift
       ;;
     --opencode)
-      target="opencode"; shift
+      target="opencode"; target_explicit="true"; shift
       ;;
     --pi)
-      target="pi"; shift
+      target="pi"; target_explicit="true"; shift
       ;;
     --claude)
       # No-op selector for symmetry with --codex / --opencode and install.sh's
       # --claude. Lets `./install.sh --uninstall --claude` (which forwards
       # remaining args here) succeed instead of hitting the unknown-flag
       # catch-all.
-      target="claude"; shift
+      target="claude"; target_explicit="true"; shift
       ;;
     -h|--help)
       # awk avoids GNU `head -n -<N>` (rejected by BSD head on macOS).
@@ -273,7 +277,65 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-if { [ "$target" = "claude" ] || [ "$target" = "opencode" ] || [ "$target" = "pi" ]; } && ! command -v jq >/dev/null 2>&1; then
+# skip_if_not_installed ends a child of a bare --uninstall quietly (exit 3)
+# unless config $1 has a line matching ERE $2 or any further path exists. A
+# client that is installed still needs jq, checked here rather than up front.
+skip_if_not_installed() {
+  [ -n "${WEAVE_UNINSTALL_ALL_CHILD:-}" ] || return 0
+  local config="$1" pattern="$2" installed="false" extra
+  shift 2
+  [ -f "$config" ] && grep -Eq -- "$pattern" "$config" && installed="true"
+  for extra in "$@"; do [ -e "$extra" ] && installed="true"; done
+  [ "$installed" = "true" ] || exit 3
+  [ "$target" = "codex" ] || command -v jq >/dev/null 2>&1 || { err "jq is required for the $target uninstall path."; exit 1; }
+}
+
+client_label() {
+  case "$1" in
+    claude) printf 'Claude Code' ;;
+    codex)  printf 'Codex' ;;
+    *)      printf '%s' "$1" ;;
+  esac
+}
+
+# A bare --uninstall removes Weave Router from every client it configured. Each
+# client runs as its own child so its path stays exactly the --<client> one. A
+# piped run with no recoverable source keeps the old Claude Code-only default.
+uninstall_self="$0"
+[ -f "$uninstall_self" ] || uninstall_self=""
+if [ "$target_explicit" = "false" ] && [ -z "${WEAVE_UNINSTALL_ALL_CHILD:-}" ] \
+  && { [ -n "$uninstall_self" ] || [ -n "${BASH_EXECUTION_STRING:-}" ]; }; then
+  uninstall_self_tmp=""
+  if [ -z "$uninstall_self" ]; then
+    uninstall_self_tmp="$(mktemp -t weave-uninstall.XXXXXX)"
+    printf '%s\n' "$BASH_EXECUTION_STRING" >"$uninstall_self_tmp"
+    uninstall_self="$uninstall_self_tmp"
+  fi
+  removed=""
+  failed=""
+  for client in claude codex opencode pi; do
+    child_status=0
+    WEAVE_UNINSTALL_ALL_CHILD=1 bash "$uninstall_self" "${uninstall_args[@]+"${uninstall_args[@]}"}" "--$client" || child_status=$?
+    case "$child_status" in
+      0) removed="${removed:+$removed, }$(client_label "$client")" ;;
+      3) ;;
+      *) failed="${failed:+$failed, }$(client_label "$client")" ;;
+    esac
+  done
+  [ -z "$uninstall_self_tmp" ] || rm -f "$uninstall_self_tmp"
+  printf '\n'
+  if [ -z "$removed" ] && [ -z "$failed" ]; then
+    info "Weave Router isn't configured for Claude Code, Codex, opencode or pi here (scope=$scope); nothing to remove."
+  fi
+  [ -z "$removed" ] || ok "Removed Weave Router from: $removed."
+  if [ -n "$failed" ]; then
+    err "Weave Router may still be routing: $failed. See the errors above."
+    exit 1
+  fi
+  exit 0
+fi
+
+if [ -z "${WEAVE_UNINSTALL_ALL_CHILD:-}" ] && { [ "$target" = "claude" ] || [ "$target" = "opencode" ] || [ "$target" = "pi" ]; } && ! command -v jq >/dev/null 2>&1; then
   err "jq is required for the $target uninstall path."
   exit 1
 fi
@@ -669,6 +731,7 @@ if [ "$target" = "opencode" ]; then
     refuse_if_symlink "$opencode_dir"
   fi
   opencode_config_file="$opencode_dir/opencode.json"
+  skip_if_not_installed "$opencode_config_file" '"weave(-claude|-codex)?"' "$opencode_dir/.weave-parked.json"
   opencode_parked="$opencode_dir/.weave-parked.json"
   opencode_direct_model=""
   refuse_if_symlink "$opencode_config_file"
@@ -849,6 +912,7 @@ if [ "$target" = "pi" ]; then
   refuse_if_symlink "$pi_settings_file"
   refuse_if_symlink "$pi_key_file"
 
+  skip_if_not_installed "$pi_models_file" '"weave"'
   report_pi_uninstall_event "$pi_models_file" "$pi_key_file" || true
   # models.json: drop provider.weave; remove the file if nothing else remains.
   # Other providers/models the user added are preserved.
@@ -966,6 +1030,7 @@ if [ "$target" = "codex" ]; then
   # exits before strip_codex_block, so one symlinked helper left the config
   # wired to a router the uninstall had just been asked to remove.
 
+  skip_if_not_installed "$codex_config_file" 'model_providers.weave'
   report_codex_uninstall_event "$codex_config_file" || true
   if [ -f "$codex_config_file" ]; then
     strip_codex_block "$codex_config_file"
@@ -1159,6 +1224,8 @@ else
   refuse_if_symlink "$statusline_ownership_file"
 fi
 
+skip_if_not_installed "$settings_file" 'ANTHROPIC_BASE_URL|Weave Router|cc-statusline' \
+  "$(dirname "$settings_file")/.weave-parked.json" "$(dirname "$settings_file")/.weave-context-window.json" "$statusline_file"
 statusline_file_owned="false"
 statusline_setting_owned="false"
 context_state_file="$(dirname "$settings_file")/.weave-context-window.json"
@@ -1187,6 +1254,7 @@ if claude_statusline_router_owned \
 fi
 
 report_claude_uninstall_event || true
+
 
 if [ -f "$settings_file" ]; then
   # Only remove keys we actually installed: scrub our env vars, and only
